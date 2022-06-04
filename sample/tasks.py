@@ -2,16 +2,22 @@
 # @Time: 2022/5/28 14:20
 # @Author: Zhengwu Cai
 # @Email: zhengwupal@163.com
-# from .models import Info, QC
+import logging
 import subprocess
 from collections.abc import Iterable
 from datetime import datetime
 import os.path
+import pandas as pd
+
+from sample.models import BaseInfo, QC
+from celery import shared_task
+
+logger = logging.getLogger('djangoProject3.sample.tasks')
 
 
 def get_stdout(cmd):
     p = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if p.returncode == 0:
+    if p.returncode == 0 and p.stdout.decode() != '':
         return [i for i in p.stdout.decode().split('\n') if i != '']
 
 
@@ -30,7 +36,7 @@ class SamplePath:
 
     @staticmethod
     def set_ifa_date(ifa_date):
-        return datetime.strptime(ifa_date, '%Y%m%d').date().strftime('%Y%m%d')
+        return ifa_date.date().strftime('%Y%m%d')
 
     def get_success_cmd(self):
         if self.ifa_date < datetime.strptime('20210601', '%Y%m%d').date().strftime('%Y%m%d'):
@@ -68,6 +74,7 @@ class SampleBaseInfo:
         self.name = self.set_name()
         self.ifa_date = self.set_ifa_date()
         self.is_paired = self.set_is_paired()
+        self.pipe_type = self.set_pipe_type()
         self.dir_type = self.set_dir_type()
 
     def set_is_cnc(self):
@@ -87,9 +94,9 @@ class SampleBaseInfo:
 
     def set_ifa_date(self):
         if self.is_cnc:
-            return self.path.split('/')[-3][3:11]
+            return datetime.strptime(self.path.split('/')[-3][3:11], '%Y%m%d').date().strftime('%Y-%m-%d')
         else:
-            return self.path.split('/')[-4][3:11]
+            return datetime.strptime(self.path.split('/')[-4][3:11], '%Y%m%d').date().strftime('%Y-%m-%d')
 
     def set_is_paired(self):
         if '_' in self.name:
@@ -99,10 +106,10 @@ class SampleBaseInfo:
 
     def set_pipe_type(self):
         if self.is_cnc:
-            if any([(i in self.product_type) for i in ['OncoD', 'DxPlasma', 'OncoET', 'OncoS']]):
-                return 'PanelPair'
-            elif any([(i in self.product_type) for i in ['OncoH', 'OncoTop']]):
+            if any([(i in self.product_type) for i in ['OncoH', 'OncoTop', 'OncoDsingle']]):
                 return 'PanelSingle'
+            elif any([(i in self.product_type) for i in ['OncoD', 'DxPlasma', 'OncoET', 'OncoS']]):
+                return 'PanelPair'
             elif any([(i in self.product_type) for i in ['OncoFusion']]):
                 return 'WTSSingle'
             elif any([(i in self.product_type) for i in ['OncoHRD']]):
@@ -116,16 +123,16 @@ class SampleBaseInfo:
             else:
                 return 'Others'
         else:
-            return 'BNC'
+            return self.product_type.split('_')[0]
 
     def set_dir_type(self):
         if self.is_cnc:
-            if any([(i in self.product_type) for i in ['OncoD', 'DxPlasma', 'OncoET', 'OncoS']]):
-                return 'PanelPair'
+            if any([(i in self.product_type) for i in ['OncoTop', 'OncoDsingle']]):
+                return 'PanelSingle'
             elif any([(i in self.product_type) for i in ['OncoH']]):
                 return 'OncoH'
-            elif any([(i in self.product_type) for i in ['OncoTop']]):
-                return 'OncoTop'
+            elif any([(i in self.product_type) for i in ['OncoD', 'DxPlasma', 'OncoET', 'OncoS']]):
+                return 'PanelPair'
             elif any([(i in self.product_type) for i in ['OncoFusion']]):
                 return 'WTSSingle'
             elif any([(i in self.product_type) for i in ['OncoHRD']]):
@@ -141,7 +148,7 @@ class SampleBaseInfo:
             else:
                 return 'Others'
         else:
-            return 'BNC'
+            return self.product_type.split('_')[0]
 
 
 # class SampleLib:
@@ -168,64 +175,85 @@ class SampleQC:
         self.path = path
         self.is_cnc = is_cnc
         self.dir_type = dir_type
-        self.c_lib = None
-        self.c_read_len = None
-        self.c_avg_seq_dep = None
-        self.c_total_bases = None
-        self.c_raw_reads = None
-        self.n_lib = None
-        self.n_read_len = None
-        self.n_avg_seq_dep = None
-        self.n_total_bases = None
-        self.n_raw_reads = None
-        self.cancer_qc, self.normal_qc = self.set_qc()
+        self.qc = self.set_qc()
 
     def set_qc(self):
         if self.dir_type in ['PanelPair', 'WESPair']:
             qc = get_stdout(f'cat {self.path}/report/qc/*.bam_qc.csv | cut -d , -f 2,3')
-            cancer_qc = [i.split(',')[0] for i in qc]
-            normal_qc = [i.split(',')[1] for i in qc]
-            self.c_lib = cancer_qc[1]
-            self.c_read_len = cancer_qc[3]
-            self.c_avg_seq_dep = cancer_qc[5]
-            self.n_lib = normal_qc[1]
-            self.n_read_len = normal_qc[3]
-            self.n_avg_seq_dep = normal_qc[5]
-            return cancer_qc, normal_qc
+            if qc is not None:
+                cancer_qc = [i.split(',')[0] for i in qc]
+                normal_qc = [i.split(',')[1] for i in qc]
+                return cancer_qc, normal_qc
+            else:
+                return None
         elif self.dir_type in ['OncoTop']:
             qc = get_stdout(f'cat {self.path}/report/qc/*.bam_qc.csv | cut -d , -f 2')
-            cancer_qc = [i.split(',')[0] for i in qc]
-            self.c_lib = cancer_qc[1]
-            self.c_read_len = cancer_qc[3]
-            self.c_avg_seq_dep = cancer_qc[5]
-            return cancer_qc, None
+            if qc is not None:
+                cancer_qc = [i.split(',')[0] for i in qc]
+                return (cancer_qc,)
+            else:
+                return None
         elif self.dir_type in ['WTSSingle']:
-            cancer_qc = get_stdout(f'cat {self.path}/report/reports/*_QC.tsv | cut -f 2')
-            self.c_raw_reads = cancer_qc[3]
-            self.c_total_bases = cancer_qc[4]
-            return cancer_qc, None
+            qc = get_stdout(f'cat {self.path}/report/reports/*_QC.tsv | cut -f 2')
+            if qc is not None:
+                lib = '_'.join(
+                    os.path.basename(get_stdout(f'ls {self.path}/input/*L00* -d | head -n 1')[0]).split('_')[4:])
+                qc.append(lib)
+                return (qc,)
+            else:
+                return None
         elif self.dir_type in ['OncoH']:
-            normal_qc = get_stdout(f'cat {self.path}/report/qc/*.bam_qc.csv | cut -d , -f 2')
-            self.n_lib = normal_qc[1]
-            self.n_read_len = normal_qc[3]
-            self.n_avg_seq_dep = normal_qc[5]
-            return None, normal_qc
+            qc = get_stdout(f'cat {self.path}/report/qc/*.bam_qc.csv | cut -d , -f 2')
+            if qc is not None:
+                return (qc,)
+            else:
+                return None
         elif self.dir_type in ['IRPair']:
-            return None, None
+            return None
         elif self.dir_type in ['IRSingle']:
-            return None, None
+            return None
         elif self.dir_type in ['OncoAi']:
-            return None, None
+            return None
 
 
 def save_sample(ifa_date):
     sp = SamplePath(ifa_date)
     for i in sp.sample_path:
-        sb = SampleBaseInfo(i)
-        sqc = SampleQC(sb.path, sb.is_cnc, sb.dir_type)
-        print(sqc.path)
-        print(sqc.c_lib)
-        print(sqc.n_lib)
+        sbi = SampleBaseInfo(i)
+        bi = BaseInfo(
+            name=sbi.name,
+            ifa_date=sbi.ifa_date,
+            product_type=sbi.product_type,
+            pipe_type=sbi.pipe_type,
+            dir_type=sbi.dir_type,
+            is_cnc=sbi.is_cnc,
+            is_paired=sbi.is_paired,
+            path=sbi.path
+        )
+        logger.info(f'{bi.path} {bi.product_type}')
+        if not BaseInfo.objects.filter(path=sbi.path).exists():
+            bi.save()
+            sqc = SampleQC(sbi.path, sbi.is_cnc, sbi.dir_type)
+            if sqc.qc is not None:
+                if sbi.dir_type in ['PanelPair', 'WESPair', 'OncoTop', 'OncoH']:
+                    for j in sqc.qc:
+                        qc = QC(sample_type1=j[0], lib=j[1], read_len=j[3], avg_seq_dep=j[5], sample=bi)
+                        qc.save()
+                elif sbi.dir_type in ['WTSSingle']:
+                    for j in sqc.qc:
+                        qc = QC(sample_type1=j[0], lib=j[-1], total_reads=j[2], total_bases=j[4], sample=bi)
+                        qc.save()
+    return f'{ifa_date} SAVE SUCCESS'
 
 
-save_sample('20220210')
+@shared_task
+def save_sample_test(date_str):
+    ifa_date = datetime.strptime(date_str, '%Y%m%d')
+    save_sample(ifa_date)
+
+
+@shared_task
+def save_sample_to_now():
+    for d in pd.date_range('20210101', datetime.now(), freq='D'):
+        logger.info(d)
+        save_sample(d)
