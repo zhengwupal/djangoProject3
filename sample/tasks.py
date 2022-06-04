@@ -8,9 +8,10 @@ from collections.abc import Iterable
 from datetime import datetime
 import os.path
 import pandas as pd
-
+import re
 from sample.models import BaseInfo, QC
 from celery import shared_task
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger('djangoProject3.sample.tasks')
 
@@ -127,26 +128,7 @@ class SampleBaseInfo:
 
     def set_dir_type(self):
         if self.is_cnc:
-            if any([(i in self.product_type) for i in ['OncoTop', 'OncoDsingle']]):
-                return 'PanelSingle'
-            elif any([(i in self.product_type) for i in ['OncoH']]):
-                return 'OncoH'
-            elif any([(i in self.product_type) for i in ['OncoD', 'DxPlasma', 'OncoET', 'OncoS']]):
-                return 'PanelPair'
-            elif any([(i in self.product_type) for i in ['OncoFusion']]):
-                return 'WTSSingle'
-            elif any([(i in self.product_type) for i in ['OncoHRD']]):
-                return 'OncoHRD'
-            elif any([(i in self.product_type) for i in ['OncoWES']]):
-                return 'WESPair'
-            elif any([(i in self.product_type) for i in ['OncoIR']]):
-                return 'IRPair'
-            elif any([(i in self.product_type) for i in ['DxIR']]):
-                return 'IRSingle'
-            elif any([(i in self.product_type) for i in ['OncoAi']]):
-                return 'OncoAi'
-            else:
-                return 'Others'
+            return re.findall(r'[A-Za-z-]+', self.product_type)[0]
         else:
             return self.product_type.split('_')[0]
 
@@ -178,7 +160,9 @@ class SampleQC:
         self.qc = self.set_qc()
 
     def set_qc(self):
-        if self.dir_type in ['PanelPair', 'WESPair']:
+        if self.dir_type in ['OncoD', 'OncoS-BLung', 'OncoS-BColon', 'OncoS-BBreast', 'OncoS-B', 'OncoS-BLiver',
+                             'OncoS-T', 'OncoD-Elung', 'MRD-B', 'MRD-T', 'OncoMD', 'OncoTNBC', 'DxPlasma', 'OncoET',
+                             'OncoWES', 'OncoWES2', 'OncoHRD']:
             qc = get_stdout(f'cat {self.path}/report/qc/*.bam_qc.csv | cut -d , -f 2,3')
             if qc is not None:
                 cancer_qc = [i.split(',')[0] for i in qc]
@@ -186,14 +170,14 @@ class SampleQC:
                 return cancer_qc, normal_qc
             else:
                 return None
-        elif self.dir_type in ['OncoTop']:
+        elif self.dir_type in ['OncoTop', 'OncoDsingle']:
             qc = get_stdout(f'cat {self.path}/report/qc/*.bam_qc.csv | cut -d , -f 2')
             if qc is not None:
                 cancer_qc = [i.split(',')[0] for i in qc]
                 return (cancer_qc,)
             else:
                 return None
-        elif self.dir_type in ['WTSSingle']:
+        elif self.dir_type in ['OncoFusion', 'OncoCUP']:
             qc = get_stdout(f'cat {self.path}/report/reports/*_QC.tsv | cut -f 2')
             if qc is not None:
                 lib = '_'.join(
@@ -208,17 +192,19 @@ class SampleQC:
                 return (qc,)
             else:
                 return None
-        elif self.dir_type in ['IRPair']:
+        elif self.dir_type in ['OncoIR']:
             return None
-        elif self.dir_type in ['IRSingle']:
+        elif self.dir_type in ['DxIR']:
             return None
         elif self.dir_type in ['OncoAi']:
             return None
 
 
 def save_sample(ifa_date):
+    logger.info(f'{ifa_date} START')
     sp = SamplePath(ifa_date)
     for i in sp.sample_path:
+        logger.debug(f'{i}')
         sbi = SampleBaseInfo(i)
         bi = BaseInfo(
             name=sbi.name,
@@ -230,20 +216,23 @@ def save_sample(ifa_date):
             is_paired=sbi.is_paired,
             path=sbi.path
         )
-        logger.info(f'{bi.path} {bi.product_type}')
+        logger.debug(f'{bi.path}')
         if not BaseInfo.objects.filter(path=sbi.path).exists():
             bi.save()
             sqc = SampleQC(sbi.path, sbi.is_cnc, sbi.dir_type)
+            logger.debug(f'{sqc.qc}')
             if sqc.qc is not None:
-                if sbi.dir_type in ['PanelPair', 'WESPair', 'OncoTop', 'OncoH']:
+                if sbi.dir_type in ['OncoD', 'OncoS-BLung', 'OncoS-BColon', 'OncoS-BBreast', 'OncoS-B', 'OncoS-BLiver',
+                                    'OncoS-T', 'MRD-T', 'OncoMD', 'DxPlasma', 'OncoET', 'OncoWES', 'OncoWES2',
+                                    'OncoTop', 'OncoH']:
                     for j in sqc.qc:
                         qc = QC(sample_type1=j[0], lib=j[1], read_len=j[3], avg_seq_dep=j[5], sample=bi)
                         qc.save()
-                elif sbi.dir_type in ['WTSSingle']:
+                elif sbi.dir_type in ['OncoFusion']:
                     for j in sqc.qc:
                         qc = QC(sample_type1=j[0], lib=j[-1], total_reads=j[2], total_bases=j[4], sample=bi)
                         qc.save()
-    return f'{ifa_date} SAVE SUCCESS'
+    logger.info(f'{ifa_date} SAVE SUCCESS')
 
 
 @shared_task
@@ -254,6 +243,14 @@ def save_sample_test(date_str):
 
 @shared_task
 def save_sample_to_now():
-    for d in pd.date_range('20210101', datetime.now(), freq='D'):
-        logger.info(d)
-        save_sample(d)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_sample = {executor.submit(save_sample, d): d for d in
+                            pd.date_range('20210101', datetime.now(), freq='D')}
+        for future in as_completed(future_to_sample):
+            sample = future_to_sample[future]
+            try:
+                data = future.result()
+            except Exception as e:
+                logger.info(f'{sample} {e}')
+            else:
+                return data
